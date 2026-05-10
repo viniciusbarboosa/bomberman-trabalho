@@ -1,372 +1,489 @@
-import json, os, random, collections
-# VIDEO https://www.youtube.com/watch?v=tz8phEIqKAM
-ALPHA         = 0.20
-GAMMA         = 0.92
-EPSILON_INI   = 1.0
-EPSILON_MIN   = 0.08
-EPSILON_DECAY = 0.9998
-Q_TABLE_FILE  = "q_table_ia1.json"
-MAX_Q_STATES  = 80_000
+import os
+import random
+import collections
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
 
-REPLAY_SIZE  = 10_000
-REPLAY_BATCH = 32
-REPLAY_EVERY = 4
+INPUT_DIM  = 30
+ACOES      = ["cima", "baixo", "esquerda", "direita", "bomba", "parado"]
+N_ACOES    = len(ACOES)
 
-# Só foge se bomba explode em <= 2s ou está no fogo
-LIMIAR_FUGA  = 2.0
+# Constantes de pontos
+PONTOS_BLOCO             = 100
+PONTOS_POWERUP_COLETADO  = 200
+PONTOS_POWERUP_DESTRUIDO = -50
+PONTOS_MATAR_JOGADOR     = 1000
+PONTOS_VITORIA           = 10000
 
-ACOES = ["cima", "baixo", "esquerda", "direita", "bomba", "parado"]
+# Hiperparâmetros DQN
+GAMMA         = 0.97
+LR            = 0.0002
+BATCH_SIZE    = 512
+BUFFER_SIZE   = 100_000
+MIN_BUFFER    = 2_000
+TARGET_UPDATE = 300
+EPSILON_START = 1.0
+EPSILON_END   = 0.05
+EPSILON_DECAY = 0.9995
 
-_G = {
-    "q_table":   {},
-    "epsilon":   EPSILON_INI,
-    "passos":    0,
-    "carregado": False,
-    "s_ant":     None,
-    "a_ant":     None,
-    "pts_ant":   None,
-    "vivo_ant":  True,
-    "pos_ant":   None,
-    "replay":    collections.deque(maxlen=REPLAY_SIZE),
-}
+MODEL_PATH = "ia_neural.pth"
+# video https://www.youtube.com/watch?v=HZ6udHUrKc0
+# https://www.youtube.com/watch?v=awz1ghokP3k
+# ══════════════════════════════════════════════════════════════════════════════
+#  REDE NEURAL — Dueling DQN
+#  V(s) + A(s,a) - mean(A) = Q(s,a)
+# ══════════════════════════════════════════════════════════════════════════════
 
+class BombermanNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.trunk = nn.Sequential(
+            nn.Linear(INPUT_DIM, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+        )
+        self.value     = nn.Linear(128, 1)
+        self.advantage = nn.Linear(128, N_ACOES)
 
-
-def _carregar():
-    if _G["carregado"]:
-        return
-    _G["carregado"] = True
-    if os.path.exists(Q_TABLE_FILE):
-        try:
-            with open(Q_TABLE_FILE) as f:
-                d = json.load(f)
-            _G["q_table"] = d.get("q_table", {})
-            _G["epsilon"] = d.get("epsilon", EPSILON_INI)
-            _G["passos"]  = d.get("passos",  0)
-            print(f"[IA-v3] Carregado: {len(_G['q_table'])} estados | "
-                  f"e={_G['epsilon']:.3f} | passos={_G['passos']}")
-        except Exception as e:
-            print(f"[IA-v3] Erro ao carregar: {e}")
-
-
-def _salvar():
-    try:
-        qt = _G["q_table"]
-        if len(qt) > MAX_Q_STATES:
-            chaves = list(qt.keys())
-            random.shuffle(chaves)
-            for k in chaves[:len(chaves) // 5]:
-                del qt[k]
-        with open(Q_TABLE_FILE, "w") as f:
-            json.dump({"q_table": qt,
-                       "epsilon": _G["epsilon"],
-                       "passos":  _G["passos"]}, f)
-    except Exception as e:
-        print(f"[IA-v3] Erro ao salvar: {e}")
+    def forward(self, x):
+        h = self.trunk(x)
+        v = self.value(h)
+        a = self.advantage(h)
+        return v + a - a.mean(dim=-1, keepdim=True)
 
 
-# ── Auxiliares ─────────────────────────────────────────────────────────────────
-def _R(mapa): return len(mapa)
-def _C(mapa): return len(mapa[0]) if mapa else 0
+class ReplayBuffer:
+    def __init__(self, capacity=BUFFER_SIZE):
+        self.buf = collections.deque(maxlen=capacity)
+
+    def push(self, s, a, r, s2, done):
+        self.buf.append((s, a, float(r), s2, float(done)))
+
+    def sample(self, n):
+        batch = random.sample(self.buf, n)
+        s, a, r, s2, d = zip(*batch)
+        return (
+            torch.FloatTensor(np.array(s)),
+            torch.LongTensor(a),
+            torch.FloatTensor(r),
+            torch.FloatTensor(np.array(s2)),
+            torch.FloatTensor(d),
+        )
+
+    def __len__(self):
+        return len(self.buf)
 
 
-def _pode_mover(gx, gy, mapa, bombas):
-    R, C = _R(mapa), _C(mapa)
-    res = {}
-    for nome, (dx, dy) in [("cima",(0,-1)),("baixo",(0,1)),
-                             ("esquerda",(-1,0)),("direita",(1,0))]:
-        nx, ny = gx+dx, gy+dy
-        ok = (0<=nx<C and 0<=ny<R and mapa[ny][nx] in [0,3,4]
-              and not any(b.x==nx and b.y==ny and not b.explodida for b in bombas))
-        res[nome] = ok
-    return res
+#Agente DQN
+class AgenteRL:
+    def __init__(self):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.online = BombermanNet().to(self.device)
+        self.target = BombermanNet().to(self.device)
+        self.target.load_state_dict(self.online.state_dict())
+        self.target.eval()
+
+        self.otimizador  = optim.Adam(self.online.parameters(), lr=LR)
+        self.scheduler   = optim.lr_scheduler.StepLR(self.otimizador, step_size=10_000, gamma=0.5)
+        self.buffer      = ReplayBuffer()
+        self.epsilon     = EPSILON_START
+        self.passo_total = 0
+
+        if os.path.exists(MODEL_PATH):
+            try:
+                ckpt = torch.load(MODEL_PATH, map_location=self.device, weights_only=False)
+                if isinstance(ckpt, dict) and "online" in ckpt:
+                    try:
+                        self.online.load_state_dict(ckpt["online"])
+                        self.target.load_state_dict(ckpt["target"])
+                        self.epsilon     = ckpt.get("epsilon", EPSILON_END)
+                        self.passo_total = ckpt.get("passo_total", 0)
+                        print(f"[IA] Modelo carregado. e={self.epsilon:.3f} | passos={self.passo_total}")
+                    except RuntimeError:
+                        print("[IA] Arquitetura mudou — apague ia_neural.pth e retreine.")
+                else:
+                    print("[IA] Formato antigo ignorado — iniciando do zero.")
+            except Exception as e:
+                print(f"[IA] Erro ao carregar: {e}")
+
+    def decidir(self, estado, proibidas=None):
+        proibidas = proibidas or []
+        if random.random() < self.epsilon:
+            validas = [i for i in range(N_ACOES) if i not in proibidas]
+            return random.choice(validas) if validas else 5
+
+        with torch.no_grad():
+            q = self.online(
+                torch.FloatTensor(estado).unsqueeze(0).to(self.device)
+            ).squeeze().cpu().numpy()
+
+        for p in proibidas:
+            q[p] = -1e9
+        return int(np.argmax(q))
+
+    def armazenar(self, s, a, r, s2, done):
+        self.buffer.push(s, a, r, s2, done)
+
+    def treinar_batch(self):
+        if len(self.buffer) < MIN_BUFFER:
+            return
+        self.passo_total += 1
+
+        s, a, r, s2, d = self.buffer.sample(BATCH_SIZE)
+        s  = s.to(self.device)
+        a  = a.to(self.device)
+        r  = r.to(self.device)
+        s2 = s2.to(self.device)
+        d  = d.to(self.device)
+
+        with torch.no_grad():
+            a_best = self.online(s2).argmax(dim=1)
+            q_next = self.target(s2).gather(1, a_best.unsqueeze(1)).squeeze()
+            alvo   = r + GAMMA * q_next * (1 - d)
+
+        q_pred = self.online(s).gather(1, a.unsqueeze(1)).squeeze()
+        loss   = nn.SmoothL1Loss()(q_pred, alvo)
+
+        self.otimizador.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.online.parameters(), 10.0)
+        self.otimizador.step()
+        self.scheduler.step()
+
+        if self.passo_total % TARGET_UPDATE == 0:
+            self.target.load_state_dict(self.online.state_dict())
+
+    def salvar(self):
+        torch.save({
+            "online":      self.online.state_dict(),
+            "target":      self.target.state_dict(),
+            "epsilon":     self.epsilon,
+            "passo_total": self.passo_total,
+        }, MODEL_PATH)
+        print(f"[IA] Salvo. e={self.epsilon:.4f} | passos={self.passo_total}")
+
+_brain   = AgenteRL()
+_estados = {}
 
 
-def _tempo_bomba_ameacando(gx, gy, bombas):
-    menor = 99.0
+def _obter_perigo(mapa, bombas):
+    perigo = set()
     for b in bombas:
-        if b.explodida:
-            continue
-        alc = 1 + (b.nivel - 1) * 2
-        if ((b.x == gx and abs(b.y - gy) <= alc) or
-                (b.y == gy and abs(b.x - gx) <= alc)):
-            menor = min(menor, b.tempo_explosao)
-    return menor
+        perigo.add((b.x, b.y))
+        alcance = 1 + (b.nivel - 1) * 2
+        for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
+            for i in range(1, alcance + 1):
+                nx, ny = b.x + dx*i, b.y + dy*i
+                if not (0 <= nx < len(mapa[0]) and 0 <= ny < len(mapa)):
+                    break
+                if mapa[ny][nx] == 2:
+                    break
+                perigo.add((nx, ny))
+                if mapa[ny][nx] == 1:
+                    break
+    return perigo
 
 
-def _no_fogo(gx, gy, bombas):
-    return any(
-        (gx, gy) in b.fogo
-        for b in bombas if b.explodida and b.tempo_fogo > 0
-    )
-
-
-def _bfs_fuga(gx, gy, mapa, bombas):
-    R, C = _R(mapa), _C(mapa)
-    dirs = [("cima",0,-1),("baixo",0,1),("esquerda",-1,0),("direita",1,0)]
-    fila = collections.deque()
-    vis  = {(gx, gy)}
-    for nome, dx, dy in dirs:
-        nx, ny = gx+dx, gy+dy
-        if not (0<=nx<C and 0<=ny<R): continue
-        if mapa[ny][nx] not in [0,3,4]: continue
-        if any(b.x==nx and b.y==ny and not b.explodida for b in bombas): continue
-        fila.append((nx, ny, nome))
-        vis.add((nx, ny))
+def _buscar_fuga(gx, gy, mapa, perigo):
+    fila     = [(gx, gy, [])]
+    visitado = {(gx, gy)}
+    DIRS     = [(0,-1),(0,1),(-1,0),(1,0)]
     while fila:
-        x, y, primeiro = fila.popleft()
-        if _tempo_bomba_ameacando(x, y, bombas) > LIMIAR_FUGA and not _no_fogo(x, y, bombas):
-            return primeiro
-        for _, dx, dy in dirs:
-            nx2, ny2 = x+dx, y+dy
-            if (nx2,ny2) in vis: continue
-            if not (0<=nx2<C and 0<=ny2<R): continue
-            if mapa[ny2][nx2] not in [0,3,4]: continue
-            if any(b.x==nx2 and b.y==ny2 and not b.explodida for b in bombas): continue
-            vis.add((nx2,ny2))
-            fila.append((nx2,ny2,primeiro))
-    return None
+        cx, cy, path = fila.pop(0)
+        if (cx, cy) not in perigo:
+            return path[0] if path else 5
+        for i, (dx, dy) in enumerate(DIRS):
+            nx, ny = cx+dx, cy+dy
+            if (0 <= nx < len(mapa[0]) and 0 <= ny < len(mapa)
+                    and mapa[ny][nx] in [0, 3, 4]
+                    and (nx, ny) not in visitado):
+                visitado.add((nx, ny))
+                fila.append((nx, ny, path + [i]))
+    return 5
 
 
-def _blocos_ao_redor(gx, gy, mapa):
-    R, C = _R(mapa), _C(mapa)
-    return sum(
-        1 for dx,dy in [(0,-1),(0,1),(-1,0),(1,0)]
-        if 0<=gx+dx<C and 0<=gy+dy<R and mapa[gy+dy][gx+dx]==1
+def _blocos_em_linha(gx, gy, mapa, nivel):
+    """qUANTIDADE DE BOLOCO QUEBRAVEL"""
+    COLS_MAP = len(mapa[0])
+    ROWS_MAP = len(mapa)
+    alcance  = 1 + (nivel - 1) * 2
+    count    = 0
+    for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
+        for i in range(1, alcance + 1):
+            nx, ny = gx + dx*i, gy + dy*i
+            if not (0 <= nx < COLS_MAP and 0 <= ny < ROWS_MAP) or mapa[ny][nx] == 2:
+                break
+            if mapa[ny][nx] == 1:
+                count += 1
+                break
+    return count
+
+
+def _inimigo_em_linha(gx, gy, mapa, players, self_player, nivel):
+    COLS_MAP = len(mapa[0])
+    ROWS_MAP = len(mapa)
+    alcance  = 1 + (nivel - 1) * 2
+    inimigos = {(o.grid_x, o.grid_y) for o in players if o is not self_player and o.ativo}
+    for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
+        for i in range(1, alcance + 1):
+            nx, ny = gx + dx*i, gy + dy*i
+            if not (0 <= nx < COLS_MAP and 0 <= ny < ROWS_MAP) or mapa[ny][nx] == 2:
+                break
+            if (nx, ny) in inimigos:
+                return 1
+            if mapa[ny][nx] == 1:
+                break
+    return 0
+
+#dADOS UTEIS QUE O PROF NAO TROUXE NO DEFINIR ACTION
+def _extrair_estado(p, mapa, players, bombas, perigo):
+    gx, gy   = p.grid_x, p.grid_y
+    COLS_MAP = len(mapa[0])
+    ROWS_MAP = len(mapa)
+    DIRS4    = [(0,-1),(0,1),(-1,0),(1,0)]
+
+    # Inimigo mais próximo
+    tx, ty, dist_ini = gx, gy, 99.0
+    for o in players:
+        if o is not p and o.ativo:
+            d = abs(gx - o.grid_x) + abs(gy - o.grid_y)
+            if d < dist_ini:
+                tx, ty, dist_ini = o.grid_x, o.grid_y, float(d)
+
+    # Bloco quebrável mais próximo
+    bx, by, dist_bloco = gx, gy, 99.0
+    for y, linha in enumerate(mapa):
+        for x, v in enumerate(linha):
+            if v == 1:
+                d = abs(gx - x) + abs(gy - y)
+                if d < dist_bloco:
+                    bx, by, dist_bloco = x, y, float(d)
+
+    # Saídas livres
+    saidas = sum(
+        1 for dx, dy in DIRS4
+        if 0 <= gx+dx < COLS_MAP and 0 <= gy+dy < ROWS_MAP
+        and mapa[gy+dy][gx+dx] in [0, 3, 4]
     )
 
+    # Vizinhança por tipo — diferencia quebrável de sólida
+    viz_livre     = []
+    viz_quebravel = []
+    viz_solida    = []
+    viz_perigo    = []
+    for dx, dy in DIRS4:
+        nx, ny  = gx+dx, gy+dy
+        em_mapa = 0 <= nx < COLS_MAP and 0 <= ny < ROWS_MAP
+        val     = mapa[ny][nx] if em_mapa else 2
+        viz_livre.append(    1.0 if em_mapa and val in [0, 3, 4] else 0.0)
+        viz_quebravel.append(1.0 if em_mapa and val == 1          else 0.0)
+        viz_solida.append(   1.0 if (not em_mapa) or val == 2     else 0.0)
+        viz_perigo.append(   1.0 if em_mapa and (nx, ny) in perigo else 0.0)
 
-def _inimigo_mp(self_player, players):
-    melhor_d, melhor_p = 999, None
-    for p in players:
-        if p is self_player or not p.ativo: continue
-        d = abs(self_player.grid_x-p.grid_x) + abs(self_player.grid_y-p.grid_y)
-        if d < melhor_d:
-            melhor_d, melhor_p = d, p
-    return melhor_d, melhor_p
+    # Bomba mais próxima
+    dist_bomba  = 1.0
+    tempo_bomba = 1.0
+    for b in bombas:
+        if not b.explodida:
+            d = (abs(gx - b.x) + abs(gy - b.y)) / 15.0
+            if d < dist_bomba:
+                dist_bomba  = d
+                tempo_bomba = min(b.tempo_explosao / 4.0, 1.0)
 
+    # Powerup mais próximo
+    dist_pu = 1.0
+    for y, linha in enumerate(mapa):
+        for x, v in enumerate(linha):
+            if v in [3, 4]:
+                d = (abs(gx - x) + abs(gy - y)) / 20.0
+                dist_pu = min(dist_pu, d)
 
-def _linha_visao(gx, gy, px, py, mapa):
-    if gx == px:
-        step = 1 if py>gy else -1
-        for y in range(gy+step, py, step):
-            if mapa[y][gx]==2: return False
-        return True
-    if gy == py:
-        step = 1 if px>gx else -1
-        for x in range(gx+step, px, step):
-            if mapa[gy][x]==2: return False
-        return True
-    return False
+    blocos_atingiveis = _blocos_em_linha(gx, gy, mapa, p.bomba_nivel)
 
+    estado = [
+        # Perigo e mobilidade (4)
+        1.0 if (gx, gy) in perigo else 0.0,             # 0
+        saidas / 4.0,                                    # 1
+        dist_bomba,                                      # 2
+        tempo_bomba,                                     # 3
 
-# ── Estado ────────────────────────────────────────────────────────────────────
+        # Posição (2)
+        gx / (COLS_MAP - 1),                             # 4
+        gy / (ROWS_MAP - 1),                             # 5
 
-def _extrair_estado(self_player, mapa, players, bombas):
-    gx, gy = self_player.grid_x, self_player.grid_y
+        # Inimigo mais próximo (3)
+        1.0 if tx > gx else (-1.0 if tx < gx else 0.0), # 6
+        1.0 if ty > gy else (-1.0 if ty < gy else 0.0), # 7
+        min(dist_ini, 20.0) / 20.0,                      # 8
 
-    # 1) Nível de perigo: 0=ok 1=bomba vindo (2-3s) 2=urgente (<=2s) 3=fogo
-    t_bomba = _tempo_bomba_ameacando(gx, gy, bombas)
-    fogo    = _no_fogo(gx, gy, bombas)
-    if fogo:              perigo = 3
-    elif t_bomba <= LIMIAR_FUGA: perigo = 2
-    elif t_bomba <= 3.0:  perigo = 1
-    else:                 perigo = 0
+        # Bloco quebrável mais próximo (3)
+        1.0 if bx > gx else (-1.0 if bx < gx else 0.0), # 9
+        1.0 if by > gy else (-1.0 if by < gy else 0.0), # 10
+        min(dist_bloco, 20.0) / 20.0,                    # 11
 
-    # 2) Urgência
-    t_disc = 0 if t_bomba>3 else (1 if t_bomba>LIMIAR_FUGA else 2)
+        # Vizinhança livre (4)
+        *viz_livre,                                      # 12-15
 
-    # 3) Bitmask de direções livres
-    livres = _pode_mover(gx, gy, mapa, bombas)
-    bitmask = ((8 if livres["cima"]     else 0) |
-               (4 if livres["baixo"]    else 0) |
-               (2 if livres["esquerda"] else 0) |
-               (1 if livres["direita"]  else 0))
+        # Vizinhança quebrável (4)
+        *viz_quebravel,                                  # 16-19
 
-    # 4) Distância ao inimigo
-    dist_ini, ini_p = _inimigo_mp(self_player, players)
-    dist_disc = 0 if dist_ini<=2 else (1 if dist_ini<=5 else (2 if dist_ini<=9 else 3))
+        # Vizinhança sólida (4)
+        *viz_solida,                                     # 20-23
 
-    # 5) Blocos ao redor
-    blocos = min(4, _blocos_ao_redor(gx, gy, mapa))
+        # Vizinhança perigo (4)
+        *viz_perigo,                                     # 24-27
 
-    # 6) Inimigo em linha de visão
-    alinhado = int(bool(ini_p and _linha_visao(gx, gy, ini_p.grid_x, ini_p.grid_y, mapa)))
+        # Extras (2)
+        dist_pu,                                         # 28
+        blocos_atingiveis / 4.0,                         # 29
+    ]
 
-    # 7) Pode colocar bomba
-    pode_bomba = int(len(self_player.bombas) < self_player.max_bombas)
-
-    # 8) Powerup perto
-    R, C = _R(mapa), _C(mapa)
-    pu = int(any(
-        mapa[gy+dy][gx+dx] in [3,4]
-        for dy in range(-3,4) for dx in range(-3,4)
-        if 0<=gx+dx<C and 0<=gy+dy<R
-    ))
-
-    # 9) Quadrante do inimigo
-    quad = 4
-    if ini_p:
-        ddx = ini_p.grid_x - gx
-        ddy = ini_p.grid_y - gy
-        quad = (1 if ddx>0 else 0) if abs(ddx)>=abs(ddy) else (3 if ddy>0 else 2)
-
-    return (perigo, t_disc, bitmask, dist_disc, blocos, alinhado, pode_bomba, pu, quad)
+    assert len(estado) == INPUT_DIM, f"Estado com {len(estado)} features!"
+    return tuple(float(x) for x in estado)
 
 
-#QTable 
-def _q(s):
-    k = str(s)
-    if k not in _G["q_table"]:
-        _G["q_table"][k] = {a: 0.0 for a in ACOES}
-    return _G["q_table"][k]
+#Recompensas calcular = ATIVIDADE PRO GRUPO: VERIFICAR AS RECOMPENSAS ESTAO DE ACOROD COM EQUILIBRIO
+def _calcular_recompensa(p, idx, gx, gy, pontos, perigo, prev, mapa, players):
+    if not p.ativo:
+        return -600.0
 
-
-def _update(s, a, r, s2):
-    qa = _q(s)
-    qa[a] += ALPHA * (r + GAMMA * max(_q(s2).values()) - qa[a])
-
-
-# ── Recompensa ────────────────────────────────────────────────────────────────
-
-def _recompensa(self_player, players, bombas, mapa,
-                pts_atual, pts_ant, ativo_atual, ativo_ant,
-                pos_ant, acao_ant):
     r = 0.0
-    gx, gy = self_player.grid_x, self_player.grid_y
+    delta_pts = pontos[idx] - prev["pts_ant"]
 
-    # Pontuação
-    delta = pts_atual - pts_ant
-    r += min(delta*0.003, 4.0) if delta>0 else max(delta*0.002, -1.0)
+    if delta_pts >= PONTOS_MATAR_JOGADOR:
+        r += 400.0
+    elif delta_pts >= PONTOS_POWERUP_COLETADO:
+        r += 25.0
+    elif delta_pts >= PONTOS_BLOCO:
+        r += 8.0
 
-    # Morte
-    if ativo_ant and not ativo_atual:
-        r -= 10.0
+    #Perigo e parado
+    if (gx, gy) in perigo:
+        r -= 40.0
+    if prev["pos_ant"] == (gx, gy):
+        r -= 3.0
 
-    # Perigo atual
-    t_bomba = _tempo_bomba_ameacando(gx, gy, bombas)
-    fogo    = _no_fogo(gx, gy, bombas)
-    if fogo:                    r -= 3.0
-    elif t_bomba <= LIMIAR_FUGA: r -= 1.0
-    elif t_bomba <= 3.0:         r -= 0.2
-
-    # Fuga bem-sucedida
-    if pos_ant:
-        px, py = pos_ant
-        t_ant = _tempo_bomba_ameacando(px, py, bombas)
-        if (t_ant<=LIMIAR_FUGA or _no_fogo(px,py,bombas)) and t_bomba>LIMIAR_FUGA and not fogo:
+    #caçar inimigos
+    inimigos = [o for o in players if o is not p and o.ativo]
+    if inimigos:
+        dist_agora = min(abs(gx - o.grid_x) + abs(gy - o.grid_y) for o in inimigos)
+        dist_antes = min(
+            abs(prev["pos_ant"][0] - o.grid_x) + abs(prev["pos_ant"][1] - o.grid_y)
+            for o in inimigos
+        )
+        if dist_agora < dist_antes:
             r += 2.0
+        elif dist_agora > dist_antes:
+            r -= 1.0
 
-    # Pressão agressiva
-    dist_ini, ini_p = _inimigo_mp(self_player, players)
-    if   dist_ini <= 2: r += 0.5
-    elif dist_ini <= 4: r += 0.2
-    elif dist_ini <= 7: r += 0.05
-    else:               r -= 0.1
+    #VER SE A BOMBA TEM ESTRATEGIA OU E INUTIL
+    if prev.get("a_ant") == 4:
+        px, py = prev["pos_ant"]
+        inimigo_estava = _inimigo_em_linha(px, py, mapa, players, p, p.bomba_nivel)
+        blocos = _blocos_em_linha(px, py, mapa, p.bomba_nivel)
+        if inimigo_estava:
+            r += 50.0
+        if blocos > 0:
+            r += blocos * 5.0
+        if blocos == 0 and not inimigo_estava:
+            r -= 30.0
 
-    # Bomba inteligente
-    if acao_ant == "bomba":
-        blocos   = _blocos_ao_redor(gx, gy, mapa)
-        alinhado = ini_p and _linha_visao(gx, gy, ini_p.grid_x, ini_p.grid_y, mapa)
-        r += 0.5 * blocos
-        if alinhado:              r += 1.0
-        if blocos==0 and not alinhado: r -= 0.8
-
-    # Parado = ruim
-    if acao_ant == "parado":
-        r -= 0.2
-
-    # Powerup perto
-    R, C = _R(mapa), _C(mapa)
-    if any(mapa[gy+dy][gx+dx] in [3,4]
-           for dy in range(-3,4) for dx in range(-3,4)
-           if 0<=gx+dx<C and 0<=gy+dy<R):
-        r += 0.08
-
-    return r
-
-
-# ── Replay ────────────────────────────────────────────────────────────────────
-
-def _replay_treinar():
-    if len(_G["replay"]) < REPLAY_BATCH:
-        return
-    for s, a, r, s2 in random.sample(_G["replay"], REPLAY_BATCH):
-        _update(s, a, r, s2)
-
-
-# ── Política ──────────────────────────────────────────────────────────────────
-
-def _escolher(s, self_player, mapa, bombas):
-    gx, gy  = self_player.grid_x, self_player.grid_y
-    livres  = _pode_mover(gx, gy, mapa, bombas)
-    t_bomba = _tempo_bomba_ameacando(gx, gy, bombas)
-    fogo    = _no_fogo(gx, gy, bombas)
-
-    # Fuga SOMENTE quando urgente
-    if fogo or t_bomba <= LIMIAR_FUGA:
-        fuga = _bfs_fuga(gx, gy, mapa, bombas)
-        if fuga:
-            return fuga
-        acoes_mv = [a for a in ["cima","baixo","esquerda","direita"] if livres.get(a)]
-        return random.choice(acoes_mv) if acoes_mv else "parado"
-
-    # Epsilon-greedy com viés agressivo
-    validas = [a for a in ACOES if a in ("bomba","parado") or livres.get(a, False)]
-    if not validas:
-        validas = ACOES
-
-    if random.random() < _G["epsilon"]:
-        pesos = [0.3 if a=="parado" else 2.0 if a=="bomba" else 2.5 for a in validas]
-        return random.choices(validas, weights=pesos)[0]
+    # Sobrevivência
+    vivos = sum(1 for pl in players if pl.ativo)
+    if vivos == 1 and p.ativo:
+        r += 300.0
     else:
-        qv = {a: _q(s)[a] for a in validas}
-        return max(qv, key=qv.get)
+        r += 0.1
+
+    return float(np.clip(r, -700.0, 500.0))
 
 
-# ── Função principal ──────────────────────────────────────────────────────────
+def decidir_acao(self_player, mapa, players, bombas, tempo, pontos, hud, self_state):
+    try:
+        idx = players.index(self_player)
+    except ValueError:
+        idx = 0
 
-def decidir_acao(self_player, mapa, players, bombas,
-                 tempo_restante, pontos, hud_info, self_state):
-    _carregar()
+    gx, gy = self_player.grid_x, self_player.grid_y
+    perigo = _obter_perigo(mapa, bombas)
+    s_atu  = _extrair_estado(self_player, mapa, players, bombas, perigo)
 
-    idx = next((i for i, p in enumerate(players) if p is self_player), None)
-    if idx is None:
+    # Treina com experiência anterior
+    if idx in _estados and _estados[idx].get("s_ant") is not None:
+        prev = _estados[idx]
+        r = _calcular_recompensa(self_player, idx, gx, gy, pontos, perigo, prev, mapa, players)
+        _brain.armazenar(prev["s_ant"], prev["a_ant"], r, s_atu, not self_player.ativo)
+        _brain.treinar_batch()
+
+    if not self_player.ativo:
+        _estados[idx] = {"s_ant": None, "a_ant": None, "pts_ant": pontos[idx], "pos_ant": (gx, gy)}
         return "parado"
 
-    pts_atual   = pontos[idx]
-    ativo_atual = self_player.ativo
-    s           = _extrair_estado(self_player, mapa, players, bombas)
+    # Fuga prioritária
+    if (gx, gy) in perigo:
+        a_idx = _buscar_fuga(gx, gy, mapa, perigo)
+    else:
+        proibidas = []
 
-    if _G["s_ant"] is not None:
-        r = _recompensa(
-            self_player, players, bombas, mapa,
-            pts_atual, _G["pts_ant"],
-            ativo_atual, _G["vivo_ant"],
-            _G["pos_ant"], _G["a_ant"]
-        )
-        _update(_G["s_ant"], _G["a_ant"], r, s)
-        _G["replay"].append((_G["s_ant"], _G["a_ant"], r, s))
+        if len(self_player.bombas) >= self_player.max_bombas:
+            proibidas.append(4)
+        else:
+            #Regra 1:só planta se tem algo útil na linha de fogo
+            blocos_uteis  = _blocos_em_linha(gx, gy, mapa, self_player.bomba_nivel)
+            inimigo_mira  = _inimigo_em_linha(gx, gy, mapa, players, self_player, self_player.bomba_nivel)
+            if blocos_uteis == 0 and inimigo_mira == 0:
+                proibidas.append(4)   # bomba inútil — proíbe
 
-    if _G["passos"] % REPLAY_EVERY == 0:
-        _replay_treinar()
+            #Regra 2:bloqueia bomba se não houver rota de fuga
+            if 4 not in proibidas:
+                perigo_futuro = set(perigo)
+                perigo_futuro.add((gx, gy))
+                alcance = 1 + (self_player.bomba_nivel - 1) * 2
+                for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
+                    for i in range(1, alcance + 1):
+                        nx, ny = gx + dx*i, gy + dy*i
+                        if not (0 <= nx < len(mapa[0]) and 0 <= ny < len(mapa)):
+                            break
+                        if mapa[ny][nx] in [1, 2]:
+                            break
+                        perigo_futuro.add((nx, ny))
+                if _buscar_fuga(gx, gy, mapa, perigo_futuro) == 5:
+                    proibidas.append(4)   #sem fuga proIbe
 
-    acao = _escolher(s, self_player, mapa, bombas)
+        a_idx = _brain.decidir(s_atu, proibidas=proibidas)
 
-    _G["epsilon"] = max(EPSILON_MIN, _G["epsilon"] * EPSILON_DECAY)
-    _G["passos"] += 1
+    #FILRAR NAO ANDAR NO PERIGO
+    nx, ny = gx, gy
+    if ACOES[a_idx] == "cima":       ny -= 1
+    elif ACOES[a_idx] == "baixo":    ny += 1
+    elif ACOES[a_idx] == "esquerda": nx -= 1
+    elif ACOES[a_idx] == "direita":  nx += 1
 
-    if _G["passos"] % 1000 == 0:
-        _salvar()
-        print(f"[IA-v3] passo={_G['passos']:>7} | "
-              f"e={_G['epsilon']:.3f} | "
-              f"estados={len(_G['q_table']):>6} | "
-              f"replay={len(_G['replay']):>5}")
+    if (nx, ny) in perigo and ACOES[a_idx] not in ["bomba", "parado"]:
+        a_idx = _buscar_fuga(gx, gy, mapa, perigo)
 
-    _G["s_ant"]    = s
-    _G["a_ant"]    = acao
-    _G["pts_ant"]  = pts_atual
-    _G["vivo_ant"] = ativo_atual
-    _G["pos_ant"]  = (self_player.grid_x, self_player.grid_y)
+    _estados[idx] = {
+        "s_ant":   s_atu,
+        "a_ant":   a_idx,
+        "pts_ant": pontos[idx],
+        "pos_ant": (gx, gy),
+    }
 
-    return acao
+    return ACOES[a_idx]
+
+
+#Helper Treino
+
+def decay_epsilon():
+    _brain.epsilon = max(EPSILON_END, _brain.epsilon * EPSILON_DECAY)
+
+def salvar():
+    _brain.salvar()
